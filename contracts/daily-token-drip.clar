@@ -6,12 +6,18 @@
 (define-constant err-insufficient-balance (err u102))
 (define-constant err-transfer-failed (err u103))
 (define-constant err-mint-failed (err u104))
+(define-constant err-insufficient-stake (err u105))
+(define-constant err-no-stake-found (err u106))
 
 (define-constant blocks-per-day u144)
 (define-constant daily-drip-amount u1000000)
+(define-constant staking-reward-rate u50)
+(define-constant min-stake-amount u100000)
 
 (define-map last-claim-block principal uint)
 (define-map user-total-claimed principal uint)
+(define-map staking-info principal { amount: uint, stake-block: uint })
+(define-map staking-rewards principal uint)
 
 (define-data-var total-supply uint u0)
 (define-data-var contract-balance uint u0)
@@ -180,4 +186,103 @@
     current-stacks-block-height: stacks-block-height,
     contract-owner: contract-owner
   }
+)
+
+(define-read-only (get-staking-info (who principal))
+  (map-get? staking-info who)
+)
+
+(define-read-only (get-staking-rewards (who principal))
+  (default-to u0 (map-get? staking-rewards who))
+)
+
+(define-read-only (calculate-staking-rewards (who principal))
+  (match (map-get? staking-info who)
+    stake-data (let (
+      (staked-amount (get amount stake-data))
+      (stake-block (get stake-block stake-data))
+      (blocks-staked (- stacks-block-height stake-block))
+      (reward-periods (/ blocks-staked blocks-per-day))
+      (base-reward (/ (* staked-amount staking-reward-rate) u10000))
+      (total-rewards (* base-reward reward-periods))
+    )
+      total-rewards
+    )
+    u0
+  )
+)
+
+(define-public (stake-tokens (amount uint))
+  (let (
+    (staker tx-sender)
+    (current-balance (ft-get-balance drip-token staker))
+    (existing-stake (map-get? staking-info staker))
+  )
+    (asserts! (>= amount min-stake-amount) err-insufficient-stake)
+    (asserts! (>= current-balance amount) err-insufficient-balance)
+    (try! (ft-transfer? drip-token amount staker (as-contract tx-sender)))
+    (match existing-stake
+      current-stake (let (
+        (current-amount (get amount current-stake))
+        (current-stake-block (get stake-block current-stake))
+        (pending-rewards (calculate-staking-rewards staker))
+        (new-total-amount (+ current-amount amount))
+      )
+        (map-set staking-rewards staker (+ (get-staking-rewards staker) pending-rewards))
+        (map-set staking-info staker { amount: new-total-amount, stake-block: stacks-block-height })
+        (ok new-total-amount)
+      )
+      (begin
+        (map-set staking-info staker { amount: amount, stake-block: stacks-block-height })
+        (ok amount)
+      )
+    )
+  )
+)
+
+(define-public (unstake-tokens (amount uint))
+  (let (
+    (staker tx-sender)
+    (stake-data (unwrap! (map-get? staking-info staker) err-no-stake-found))
+    (staked-amount (get amount stake-data))
+    (pending-rewards (calculate-staking-rewards staker))
+    (total-rewards (+ (get-staking-rewards staker) pending-rewards))
+  )
+    (asserts! (>= staked-amount amount) err-insufficient-stake)
+    (try! (as-contract (ft-transfer? drip-token amount tx-sender staker)))
+    (if (is-eq amount staked-amount)
+      (begin
+        (map-delete staking-info staker)
+        (map-delete staking-rewards staker)
+        (if (> total-rewards u0)
+          (try! (ft-mint? drip-token total-rewards staker))
+          true
+        )
+      )
+      (map-set staking-info staker { 
+        amount: (- staked-amount amount), 
+        stake-block: stacks-block-height 
+      })
+    )
+    (ok { unstaked: amount, rewards: total-rewards })
+  )
+)
+
+(define-public (claim-staking-rewards)
+  (let (
+    (staker tx-sender)
+    (stake-data (unwrap! (map-get? staking-info staker) err-no-stake-found))
+    (pending-rewards (calculate-staking-rewards staker))
+    (accumulated-rewards (get-staking-rewards staker))
+    (total-rewards (+ pending-rewards accumulated-rewards))
+  )
+    (asserts! (> total-rewards u0) err-insufficient-balance)
+    (try! (ft-mint? drip-token total-rewards staker))
+    (map-set staking-info staker { 
+      amount: (get amount stake-data), 
+      stake-block: stacks-block-height 
+    })
+    (map-set staking-rewards staker u0)
+    (ok total-rewards)
+  )
 )
