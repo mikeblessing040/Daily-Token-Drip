@@ -8,19 +8,31 @@
 (define-constant err-mint-failed (err u104))
 (define-constant err-insufficient-stake (err u105))
 (define-constant err-no-stake-found (err u106))
+(define-constant err-referral-not-found (err u107))
+(define-constant err-self-referral (err u108))
+(define-constant err-already-referred (err u109))
 
 (define-constant blocks-per-day u144)
 (define-constant daily-drip-amount u1000000)
 (define-constant staking-reward-rate u50)
 (define-constant min-stake-amount u100000)
+(define-constant referral-bonus-rate u10)
+(define-constant referee-bonus-rate u5)
 
 (define-map last-claim-block principal uint)
 (define-map user-total-claimed principal uint)
 (define-map staking-info principal { amount: uint, stake-block: uint })
 (define-map staking-rewards principal uint)
+(define-map referral-codes principal uint)
+(define-map code-to-user uint principal)
+(define-map user-referrals principal (list 50 principal))
+(define-map referral-count principal uint)
+(define-map user-referrer principal principal)
+(define-map referral-bonuses principal uint)
 
 (define-data-var total-supply uint u0)
 (define-data-var contract-balance uint u0)
+(define-data-var next-referral-code uint u1000)
 
 (define-read-only (get-name)
   "Drip Token"
@@ -285,4 +297,143 @@
     (map-set staking-rewards staker u0)
     (ok total-rewards)
   )
+)
+
+(define-read-only (get-referral-code (who principal))
+  (map-get? referral-codes who)
+)
+
+(define-read-only (get-user-by-code (code uint))
+  (map-get? code-to-user code)
+)
+
+(define-read-only (get-referral-count (who principal))
+  (default-to u0 (map-get? referral-count who))
+)
+
+(define-read-only (get-user-referrer (who principal))
+  (map-get? user-referrer who)
+)
+
+(define-read-only (get-referral-bonuses (who principal))
+  (default-to u0 (map-get? referral-bonuses who))
+)
+
+(define-read-only (get-referral-tier (who principal))
+  (let (
+    (ref-count (get-referral-count who))
+  )
+    (if (>= ref-count u50) u4
+      (if (>= ref-count u25) u3
+        (if (>= ref-count u10) u2
+          (if (>= ref-count u5) u1 u0)
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (calculate-tier-bonus (tier uint))
+  (if (is-eq tier u4) u25
+    (if (is-eq tier u3) u20
+      (if (is-eq tier u2) u15
+        (if (is-eq tier u1) u10 u0)
+      )
+    )
+  )
+)
+
+(define-public (create-referral-code)
+  (let (
+    (user tx-sender)
+    (current-code (var-get next-referral-code))
+    (existing-code (map-get? referral-codes user))
+  )
+    (asserts! (is-none existing-code) err-already-referred)
+    (map-set referral-codes user current-code)
+    (map-set code-to-user current-code user)
+    (var-set next-referral-code (+ current-code u1))
+    (ok current-code)
+  )
+)
+
+(define-public (join-with-referral (referral-code uint))
+  (let (
+    (new-user tx-sender)
+    (referrer (unwrap! (map-get? code-to-user referral-code) err-referral-not-found))
+    (existing-referrer (map-get? user-referrer new-user))
+  )
+    (asserts! (not (is-eq new-user referrer)) err-self-referral)
+    (asserts! (is-none existing-referrer) err-already-referred)
+    (let (
+      (current-refs (default-to (list) (map-get? user-referrals referrer)))
+      (current-count (get-referral-count referrer))
+      (tier (get-referral-tier referrer))
+      (tier-bonus (calculate-tier-bonus tier))
+      (referrer-bonus (/ (* daily-drip-amount (+ referral-bonus-rate tier-bonus)) u100))
+      (referee-bonus (/ (* daily-drip-amount referee-bonus-rate) u100))
+    )
+      (map-set user-referrer new-user referrer)
+      (map-set user-referrals referrer (unwrap-panic (as-max-len? (append current-refs new-user) u50)))
+      (map-set referral-count referrer (+ current-count u1))
+      (if (> referrer-bonus u0)
+        (begin
+          (try! (ft-mint? drip-token referrer-bonus referrer))
+          (map-set referral-bonuses referrer (+ (get-referral-bonuses referrer) referrer-bonus))
+        )
+        true
+      )
+      (if (> referee-bonus u0)
+        (begin
+          (try! (ft-mint? drip-token referee-bonus new-user))
+          (map-set referral-bonuses new-user (+ (get-referral-bonuses new-user) referee-bonus))
+        )
+        true
+      )
+      (ok { referrer: referrer, referrer-bonus: referrer-bonus, referee-bonus: referee-bonus })
+    )
+  )
+)
+
+(define-public (claim-with-referral-bonus)
+  (let (
+    (claimer tx-sender)
+    (last-claim (get-last-claim-block claimer))
+    (current-block stacks-block-height)
+    (blocks-since-claim (- current-block last-claim))
+    (current-claimed (get-user-total-claimed claimer))
+    (base-amount daily-drip-amount)
+    (referrer-opt (map-get? user-referrer claimer))
+  )
+    (asserts! (>= blocks-since-claim blocks-per-day) err-not-enough-time)
+    (let (
+      (bonus-amount (match referrer-opt
+        referrer (let (
+          (tier (get-referral-tier referrer))
+          (bonus-rate (/ (calculate-tier-bonus tier) u2))
+        )
+          (/ (* base-amount bonus-rate) u100)
+        )
+        u0
+      ))
+      (total-amount (+ base-amount bonus-amount))
+    )
+      (try! (ft-mint? drip-token total-amount claimer))
+      (map-set last-claim-block claimer current-block)
+      (map-set user-total-claimed claimer (+ current-claimed total-amount))
+      (var-set total-supply (+ (var-get total-supply) total-amount))
+      (ok { base-amount: base-amount, bonus-amount: bonus-amount, total-amount: total-amount })
+    )
+  )
+)
+
+(define-read-only (get-referral-network-info (who principal))
+  {
+    referral-code: (map-get? referral-codes who),
+    referrer: (map-get? user-referrer who),
+    referral-count: (get-referral-count who),
+    referral-tier: (get-referral-tier who),
+    total-bonuses: (get-referral-bonuses who),
+    tier-bonus-rate: (calculate-tier-bonus (get-referral-tier who))
+  }
 )
