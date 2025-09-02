@@ -11,6 +11,8 @@
 (define-constant err-referral-not-found (err u107))
 (define-constant err-self-referral (err u108))
 (define-constant err-already-referred (err u109))
+(define-constant err-no-streak-freeze (err u110))
+(define-constant err-streak-freeze-active (err u111))
 
 (define-constant blocks-per-day u144)
 (define-constant daily-drip-amount u1000000)
@@ -18,6 +20,8 @@
 (define-constant min-stake-amount u100000)
 (define-constant referral-bonus-rate u10)
 (define-constant referee-bonus-rate u5)
+(define-constant max-streak-multiplier u50)
+(define-constant streak-milestone-bonus u500000)
 
 (define-map last-claim-block principal uint)
 (define-map user-total-claimed principal uint)
@@ -29,6 +33,9 @@
 (define-map referral-count principal uint)
 (define-map user-referrer principal principal)
 (define-map referral-bonuses principal uint)
+(define-map user-streaks principal { current: uint, longest: uint, last-claim-day: uint })
+(define-map streak-freezes principal uint)
+(define-map milestone-rewards principal uint)
 
 (define-data-var total-supply uint u0)
 (define-data-var contract-balance uint u0)
@@ -436,4 +443,158 @@
     total-bonuses: (get-referral-bonuses who),
     tier-bonus-rate: (calculate-tier-bonus (get-referral-tier who))
   }
+)
+
+(define-read-only (get-current-day)
+  (/ stacks-block-height blocks-per-day)
+)
+
+(define-read-only (get-user-streak (who principal))
+  (default-to { current: u0, longest: u0, last-claim-day: u0 } (map-get? user-streaks who))
+)
+
+(define-read-only (get-streak-freezes (who principal))
+  (default-to u0 (map-get? streak-freezes who))
+)
+
+(define-read-only (get-milestone-rewards (who principal))
+  (default-to u0 (map-get? milestone-rewards who))
+)
+
+(define-read-only (calculate-streak-multiplier (streak uint))
+  (let (
+    (base-multiplier (if (<= streak u10) streak (+ u10 (/ (- streak u10) u2))))
+  )
+    (if (> base-multiplier max-streak-multiplier) max-streak-multiplier base-multiplier)
+  )
+)
+
+(define-read-only (get-streak-milestone-tier (streak uint))
+  (if (>= streak u100) u5
+    (if (>= streak u50) u4
+      (if (>= streak u30) u3
+        (if (>= streak u15) u2
+          (if (>= streak u7) u1 u0)
+        )
+      )
+    )
+  )
+)
+
+(define-public (claim-with-streak-bonus)
+  (let (
+    (claimer tx-sender)
+    (current-day (get-current-day))
+    (last-claim (get-last-claim-block claimer))
+    (blocks-since-claim (- stacks-block-height last-claim))
+    (current-claimed (get-user-total-claimed claimer))
+    (current-streak-data (get-user-streak claimer))
+    (current-streak (get current current-streak-data))
+    (longest-streak (get longest current-streak-data))
+    (last-claim-day (get last-claim-day current-streak-data))
+    (freeze-count (get-streak-freezes claimer))
+  )
+    (asserts! (>= blocks-since-claim blocks-per-day) err-not-enough-time)
+    (let (
+      (is-consecutive (or (is-eq last-claim-day (- current-day u1)) (is-eq last-claim-day u0)))
+      (has-freeze (> freeze-count u0))
+      (new-streak (if (or is-consecutive (and (not is-consecutive) has-freeze))
+        (+ current-streak u1)
+        u1
+      ))
+      (new-longest (if (> new-streak longest-streak) new-streak longest-streak))
+      (streak-multiplier (calculate-streak-multiplier new-streak))
+      (base-amount daily-drip-amount)
+      (streak-bonus (/ (* base-amount streak-multiplier) u100))
+      (total-amount (+ base-amount streak-bonus))
+      (milestone-tier (get-streak-milestone-tier new-streak))
+      (milestone-bonus (if (and (> milestone-tier u0) (not (is-eq new-streak current-streak))) streak-milestone-bonus u0))
+    )
+      (if (and (not is-consecutive) has-freeze)
+        (map-set streak-freezes claimer (- freeze-count u1))
+        true
+      )
+      (try! (ft-mint? drip-token (+ total-amount milestone-bonus) claimer))
+      (map-set last-claim-block claimer stacks-block-height)
+      (map-set user-total-claimed claimer (+ current-claimed (+ total-amount milestone-bonus)))
+      (map-set user-streaks claimer { 
+        current: new-streak, 
+        longest: new-longest, 
+        last-claim-day: current-day 
+      })
+      (if (> milestone-bonus u0)
+        (map-set milestone-rewards claimer (+ (get-milestone-rewards claimer) milestone-bonus))
+        true
+      )
+      (var-set total-supply (+ (var-get total-supply) (+ total-amount milestone-bonus)))
+      (ok { 
+        base-amount: base-amount,
+        streak-bonus: streak-bonus,
+        milestone-bonus: milestone-bonus,
+        total-amount: (+ total-amount milestone-bonus),
+        new-streak: new-streak,
+        streak-multiplier: streak-multiplier
+      })
+    )
+  )
+)
+
+(define-public (purchase-streak-freeze)
+  (let (
+    (buyer tx-sender)
+    (current-balance (ft-get-balance drip-token buyer))
+    (freeze-cost (* daily-drip-amount u5))
+    (current-freezes (get-streak-freezes buyer))
+  )
+    (asserts! (>= current-balance freeze-cost) err-insufficient-balance)
+    (asserts! (< current-freezes u3) err-streak-freeze-active)
+    (try! (ft-transfer? drip-token freeze-cost buyer (as-contract tx-sender)))
+    (map-set streak-freezes buyer (+ current-freezes u1))
+    (ok (+ current-freezes u1))
+  )
+)
+
+(define-read-only (get-streak-analytics (who principal))
+  (let (
+    (streak-data (get-user-streak who))
+    (current-streak (get current streak-data))
+    (longest-streak (get longest streak-data))
+    (freeze-count (get-streak-freezes who))
+    (milestone-rewards-earned (get-milestone-rewards who))
+    (current-multiplier (calculate-streak-multiplier current-streak))
+    (milestone-tier (get-streak-milestone-tier current-streak))
+  )
+    {
+      current-streak: current-streak,
+      longest-streak: longest-streak,
+      streak-multiplier: current-multiplier,
+      milestone-tier: milestone-tier,
+      freeze-count: freeze-count,
+      total-milestone-rewards: milestone-rewards-earned,
+      next-milestone: (if (< current-streak u7) u7
+        (if (< current-streak u15) u15
+          (if (< current-streak u30) u30
+            (if (< current-streak u50) u50
+              (if (< current-streak u100) u100 u0)
+            )
+          )
+        )
+      )
+    }
+  )
+)
+
+(define-public (gift-streak-freeze (recipient principal))
+  (let (
+    (gifter tx-sender)
+    (current-balance (ft-get-balance drip-token gifter))
+    (freeze-cost (* daily-drip-amount u3))
+    (recipient-freezes (get-streak-freezes recipient))
+  )
+    (asserts! (>= current-balance freeze-cost) err-insufficient-balance)
+    (asserts! (< recipient-freezes u3) err-streak-freeze-active)
+    (try! (ft-transfer? drip-token freeze-cost gifter (as-contract tx-sender)))
+    (map-set streak-freezes recipient (+ recipient-freezes u1))
+    (ok { recipient: recipient, new-freeze-count: (+ recipient-freezes u1) })
+  )
 )
