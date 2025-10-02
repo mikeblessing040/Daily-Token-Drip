@@ -13,6 +13,9 @@
 (define-constant err-already-referred (err u109))
 (define-constant err-no-streak-freeze (err u110))
 (define-constant err-streak-freeze-active (err u111))
+(define-constant err-treasury-depleted (err u112))
+(define-constant err-minimum-burn (err u113))
+(define-constant err-proposal-exists (err u114))
 
 (define-constant blocks-per-day u144)
 (define-constant daily-drip-amount u1000000)
@@ -22,6 +25,8 @@
 (define-constant referee-bonus-rate u5)
 (define-constant max-streak-multiplier u50)
 (define-constant streak-milestone-bonus u500000)
+(define-constant min-burn-amount u10000)
+(define-constant treasury-reward-multiplier u200)
 
 (define-map last-claim-block principal uint)
 (define-map user-total-claimed principal uint)
@@ -36,10 +41,16 @@
 (define-map user-streaks principal { current: uint, longest: uint, last-claim-day: uint })
 (define-map streak-freezes principal uint)
 (define-map milestone-rewards principal uint)
+(define-map treasury-contributions principal uint)
+(define-map burn-history principal uint)
+(define-map treasury-withdrawals principal uint)
 
 (define-data-var total-supply uint u0)
 (define-data-var contract-balance uint u0)
 (define-data-var next-referral-code uint u1000)
+(define-data-var community-treasury uint u0)
+(define-data-var total-burned uint u0)
+(define-data-var treasury-distribution-ratio uint u50)
 
 (define-read-only (get-name)
   "Drip Token"
@@ -596,5 +607,136 @@
     (try! (ft-transfer? drip-token freeze-cost gifter (as-contract tx-sender)))
     (map-set streak-freezes recipient (+ recipient-freezes u1))
     (ok { recipient: recipient, new-freeze-count: (+ recipient-freezes u1) })
+  )
+)
+
+(define-read-only (get-treasury-balance)
+  (var-get community-treasury)
+)
+
+(define-read-only (get-total-burned)
+  (var-get total-burned)
+)
+
+(define-read-only (get-user-contributions (who principal))
+  (default-to u0 (map-get? treasury-contributions who))
+)
+
+(define-read-only (get-user-burn-history (who principal))
+  (default-to u0 (map-get? burn-history who))
+)
+
+(define-read-only (get-user-treasury-withdrawals (who principal))
+  (default-to u0 (map-get? treasury-withdrawals who))
+)
+
+(define-read-only (calculate-burn-reward (burn-amount uint))
+  (let (
+    (reward-percentage (var-get treasury-distribution-ratio))
+    (base-reward (/ (* burn-amount reward-percentage) u100))
+  )
+    base-reward
+  )
+)
+
+(define-read-only (get-contribution-tier (who principal))
+  (let (
+    (total-contributed (get-user-contributions who))
+  )
+    (if (>= total-contributed (* daily-drip-amount u100)) u5
+      (if (>= total-contributed (* daily-drip-amount u50)) u4
+        (if (>= total-contributed (* daily-drip-amount u25)) u3
+          (if (>= total-contributed (* daily-drip-amount u10)) u2
+            (if (>= total-contributed (* daily-drip-amount u5)) u1 u0)
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-public (contribute-to-treasury (amount uint))
+  (let (
+    (contributor tx-sender)
+    (current-balance (ft-get-balance drip-token contributor))
+    (current-contributions (get-user-contributions contributor))
+  )
+    (asserts! (>= current-balance amount) err-insufficient-balance)
+    (try! (ft-transfer? drip-token amount contributor (as-contract tx-sender)))
+    (var-set community-treasury (+ (var-get community-treasury) amount))
+    (map-set treasury-contributions contributor (+ current-contributions amount))
+    (ok { contributed: amount, total-contributions: (+ current-contributions amount) })
+  )
+)
+
+(define-public (burn-tokens (amount uint))
+  (let (
+    (burner tx-sender)
+    (current-balance (ft-get-balance drip-token burner))
+    (current-burned (get-user-burn-history burner))
+    (treasury-balance (var-get community-treasury))
+    (burn-reward (calculate-burn-reward amount))
+  )
+    (asserts! (>= amount min-burn-amount) err-minimum-burn)
+    (asserts! (>= current-balance amount) err-insufficient-balance)
+    (asserts! (>= treasury-balance burn-reward) err-treasury-depleted)
+    (try! (ft-burn? drip-token amount burner))
+    (var-set total-burned (+ (var-get total-burned) amount))
+    (map-set burn-history burner (+ current-burned amount))
+    (if (> burn-reward u0)
+      (begin
+        (try! (as-contract (ft-transfer? drip-token burn-reward tx-sender burner)))
+        (var-set community-treasury (- treasury-balance burn-reward))
+        (map-set treasury-withdrawals burner (+ (get-user-treasury-withdrawals burner) burn-reward))
+      )
+      true
+    )
+    (ok { burned: amount, treasury-reward: burn-reward, total-burned: (+ current-burned amount) })
+  )
+)
+
+(define-public (claim-treasury-dividend)
+  (let (
+    (claimer tx-sender)
+    (contribution-tier (get-contribution-tier claimer))
+    (treasury-balance (var-get community-treasury))
+    (dividend-rate (if (is-eq contribution-tier u5) u10
+      (if (is-eq contribution-tier u4) u8
+        (if (is-eq contribution-tier u3) u6
+          (if (is-eq contribution-tier u2) u4
+            (if (is-eq contribution-tier u1) u2 u0)
+          )
+        )
+      )
+    ))
+    (dividend-amount (/ (* (get-user-contributions claimer) dividend-rate) u1000))
+  )
+    (asserts! (> contribution-tier u0) err-insufficient-balance)
+    (asserts! (>= treasury-balance dividend-amount) err-treasury-depleted)
+    (try! (as-contract (ft-transfer? drip-token dividend-amount tx-sender claimer)))
+    (var-set community-treasury (- treasury-balance dividend-amount))
+    (map-set treasury-withdrawals claimer (+ (get-user-treasury-withdrawals claimer) dividend-amount))
+    (ok { dividend: dividend-amount, tier: contribution-tier })
+  )
+)
+
+(define-read-only (get-treasury-analytics (who principal))
+  {
+    treasury-balance: (var-get community-treasury),
+    total-burned: (var-get total-burned),
+    user-contributions: (get-user-contributions who),
+    user-burn-history: (get-user-burn-history who),
+    user-withdrawals: (get-user-treasury-withdrawals who),
+    contribution-tier: (get-contribution-tier who),
+    current-distribution-ratio: (var-get treasury-distribution-ratio)
+  }
+)
+
+(define-public (update-distribution-ratio (new-ratio uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-ratio u100) err-insufficient-balance)
+    (var-set treasury-distribution-ratio new-ratio)
+    (ok new-ratio)
   )
 )
