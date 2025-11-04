@@ -1,5 +1,46 @@
 (define-fungible-token drip-token)
 
+(define-constant drip-amount u100)
+(define-constant claim-interval u1)
+
+(define-map last-claim-period principal uint)
+(define-data-var current-period uint u0)
+
+(define-read-only (get-last-claim (user principal))
+  (map-get? last-claim-period user)
+)
+
+(define-read-only (get-next-claim-period (user principal))
+  (let (
+    (last (default-to u0 (map-get? last-claim-period user)))
+  )
+    (ok (+ last claim-interval))
+  )
+)
+
+(define-public (claim)
+  (let (
+    (last (default-to u0 (map-get? last-claim-period tx-sender)))
+    (current (var-get current-period))
+    (next (+ last claim-interval))
+  )
+    (if (>= current next)
+      (begin
+        (map-set last-claim-period tx-sender current)
+        (ok true)
+      )
+      (err u100)
+    )
+  )
+)
+
+(define-public (advance-period)
+  (begin
+    (var-set current-period (+ (var-get current-period) u1))
+    (ok (var-get current-period))
+  )
+)
+
 (define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
 (define-constant err-not-enough-time (err u101))
